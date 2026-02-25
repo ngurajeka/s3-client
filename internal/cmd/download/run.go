@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -14,9 +13,9 @@ import (
 	"time"
 
 	"s3-client/internal/s3uri"
+	"s3-client/internal/shared/config"
+	"s3-client/internal/shared/s3ops"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -39,7 +38,7 @@ func printUsage(fs *flag.FlagSet) {
 const defaultConcurrency = 5
 
 const (
-	stateWaiting     = iota
+	stateWaiting = iota
 	stateDownloading
 	stateDone
 	stateFailed
@@ -190,15 +189,14 @@ func formatDuration(d time.Duration) string {
 	return fmt.Sprintf("%ds", s)
 }
 
-// Run runs the download subcommand. args are the arguments after the subcommand name.
-// Returns exit code (0 for success).
 func Run(args []string) int {
 	fs := newFlagSet()
 	output := fs.String("output", "", "Output file path (defaults to basename of the S3 key)")
 	chunkMB := fs.Int("chunk-size", 10, "Chunk size in MB")
 	concurrency := fs.Int("concurrency", defaultConcurrency, "Number of parallel chunk downloads")
-	region := fs.String("region", "", "AWS region (overrides env/config)")
-	profile := fs.String("profile", "", "AWS credentials/config profile name")
+
+	opts := &config.Options{}
+	config.AddFlags(fs, opts)
 
 	fs.Usage = func() {
 		printUsage(fs)
@@ -224,16 +222,8 @@ func Run(args []string) int {
 		outputPath = filepath.Base(key)
 	}
 
-	var opts []func(*config.LoadOptions) error
-	if *region != "" {
-		opts = append(opts, config.WithRegion(*region))
-	}
-	if *profile != "" {
-		opts = append(opts, config.WithSharedConfigProfile(*profile))
-	}
-
 	ctx := context.Background()
-	cfg, err := config.LoadDefaultConfig(ctx, opts...)
+	cfg, err := config.Load(ctx, *opts)
 	if err != nil {
 		log.Fatalf("Failed to load AWS config: %v", err)
 	}
@@ -248,8 +238,8 @@ func Run(args []string) int {
 		fmt.Fprintf(os.Stderr, "\nDetail: %v\n", err)
 		return 1
 	}
-	if *profile != "" {
-		fmt.Printf("Using AWS profile: %s (source: %s)\n", *profile, creds.Source)
+	if opts.Profile != "" {
+		fmt.Printf("Using AWS profile: %s (source: %s)\n", opts.Profile, creds.Source)
 	}
 
 	client := s3.NewFromConfig(cfg)
@@ -288,14 +278,11 @@ func Run(args []string) int {
 }
 
 func (d *downloader) download(ctx context.Context) error {
-	headResp, err := d.client.HeadObject(ctx, &s3.HeadObjectInput{
-		Bucket: aws.String(d.bucket),
-		Key:    aws.String(d.key),
-	})
+	meta, err := s3ops.HeadObject(ctx, d.client, d.bucket, d.key)
 	if err != nil {
 		return fmt.Errorf("HeadObject failed: %w", err)
 	}
-	totalSize := aws.ToInt64(headResp.ContentLength)
+	totalSize := meta.Size
 	fmt.Printf("Object size: %.2f MB (%d bytes)\n", float64(totalSize)/1024/1024, totalSize)
 
 	f, err := os.OpenFile(d.outputPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0644)
@@ -355,23 +342,13 @@ func (d *downloader) download(ctx context.Context) error {
 			for c := range chunkCh {
 				pb.setState(c.index, stateDownloading)
 
-				rangeVal := fmt.Sprintf("bytes=%d-%d", c.start, c.end)
-				resp, err := d.client.GetObject(ctx, &s3.GetObjectInput{
-					Bucket: aws.String(d.bucket),
-					Key:    aws.String(d.key),
-					Range:  aws.String(rangeVal),
+				data, err := s3ops.DownloadRange(ctx, d.client, d.bucket, d.key, s3ops.RangeDownload{
+					Start: c.start,
+					End:   c.end,
 				})
 				if err != nil {
 					pb.setState(c.index, stateFailed)
-					errCh <- fmt.Errorf("chunk %d (%s) GetObject failed: %w", c.index, rangeVal, err)
-					return
-				}
-
-				data, err := io.ReadAll(resp.Body)
-				resp.Body.Close()
-				if err != nil {
-					pb.setState(c.index, stateFailed)
-					errCh <- fmt.Errorf("chunk %d read failed: %w", c.index, err)
+					errCh <- fmt.Errorf("chunk %d (%d-%d) DownloadRange failed: %w", c.index, c.start, c.end, err)
 					return
 				}
 
