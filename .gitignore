@@ -1,0 +1,5 @@
+s3-client
+.DS_Store
+.idea
+.vscode
+*.log
